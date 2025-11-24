@@ -113,40 +113,41 @@ def init_db():
         """
     )
 
-    # ★ 新規：スロットごとの「当たり」だけを記録するテーブル
+    # スロット当たり用（さっき追加したやつ）
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS slot_hits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT,          -- 当たり検出した時間 (ISO)
-            date TEXT,        -- YYYY-MM-DD
-            player TEXT,      -- プレイヤー名
-            slot_key TEXT,    -- 論理名: TRAIN / TENKU / ZEUS / ABYSS / NATSU / ...
-            slot_name TEXT,   -- 表示名: 列車スロット / 天空スロット / アビススロット 等
-            hit_type TEXT,    -- 当たりの種類: BIGBONUS / RUSH / GALAXY_RUSH / 深淵ヒット など
-            win_amount INTEGER, -- 獲得金額 (わからなければ 0)
-            raw_message TEXT  -- 当たり判定に使った生ログ
+            ts TEXT,
+            date TEXT,
+            player TEXT,
+            slot_key TEXT,
+            slot_name TEXT,
+            hit_type TEXT,
+            win_amount INTEGER,
+            raw_message TEXT
         )
         """
     )
-        # ★ 新規：ルーレットの「獲得」だけを記録するテーブル
+
+    # ★ 新規：ルーレット専用テーブル
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS roulette_hits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT,          -- 獲得を検出した時間 (ISO)
+            ts TEXT,          -- 保存した日時 (ISO)
             date TEXT,        -- YYYY-MM-DD
             player TEXT,      -- プレイヤー名
-            game TEXT,        -- ゲーム名（例: Roulette）
-            amount INTEGER,   -- 獲得金額
+            game TEXT,        -- ルーレット名 (例: MAN10ルーレット)
+            win_amount INTEGER, -- 獲得金額
             raw_message TEXT  -- 生ログ
         )
         """
     )
 
-
     conn.commit()
     conn.close()
+
 
 
 init_db()
@@ -427,6 +428,53 @@ def detect_and_save_slot_hits(msg: str, parsed: Optional[Tuple[str, str, str]] =
     for h in hits:
         save_slot_hit(h)
 
+def parse_roulette_message(msg: str) -> Optional[Tuple[str, str, int]]:
+    """
+    ルーレット系ログから (player, game, win_amount) を取り出す。
+    例: KANON017002はMAN10ルーレットで〇〇円獲得！ みたいなやつを想定。
+    ※ ログの実物を見て必要なら正規表現を調整していく。
+    """
+    if "ルーレット" not in msg or "円獲得" not in msg:
+        return None
+
+    # 先頭のプレイヤー名（スペースか「は」まで）
+    m_player = re.match(r"(?P<player>\S+)", msg)
+    if not m_player:
+        return None
+    player = m_player.group("player")
+
+    # 「○○ルーレット」っぽい部分をゲーム名として抜く
+    m_game = re.search(r"(?P<game>[\wァ-ヶ一-龠ぁ-んA-Za-z0-9]+ルーレット)", msg)
+    game = m_game.group("game") if m_game else "ルーレット"
+
+    # 金額
+    m_yen = re.search(r"([0-9,]+)円獲得", msg)
+    if not m_yen:
+        return None
+    win_amount = int(m_yen.group(1).replace(",", ""))
+
+    return player, game, win_amount
+
+
+def save_roulette_win(player: str, game: str, win_amount: int, raw: str) -> None:
+    """ルーレットの当たり1件を roulette_hits に保存"""
+    now = datetime.now()
+    ts = now.isoformat(timespec="seconds")
+    date_str = now.strftime("%Y-%m-%d")
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO roulette_hits (ts, date, player, game, win_amount, raw_message)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (ts, date_str, player, game, win_amount, raw),
+    )
+    conn.commit()
+    conn.close()
+
+
 # =====================================================
 #  日次集計 & グラフ作成
 # =====================================================
@@ -599,6 +647,43 @@ def aggregate_money_range(start: Optional[datetime], end: Optional[datetime]) ->
             """,
             (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
         )
+def aggregate_roulette_range(start: Optional[datetime], end: Optional[datetime]) -> List[Tuple[str, str, int, int]]:
+    """
+    ルーレットについて、指定範囲 [start, end) の
+    player, game ごとの (回数, 獲得合計) を集計して返す。
+    戻り値: [(player, game, count, total_yen), ...]
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    if start is None or end is None:
+        cur.execute(
+            """
+            SELECT player, game, COUNT(*), SUM(win_amount)
+            FROM roulette_hits
+            GROUP BY player, game
+            ORDER BY SUM(win_amount) DESC
+            """
+        )
+    else:
+        cur.execute(
+            """
+            SELECT player, game, COUNT(*), SUM(win_amount)
+            FROM roulette_hits
+            WHERE ts >= ? AND ts < ?
+            GROUP BY player, game
+            ORDER BY SUM(win_amount) DESC
+            """,
+            (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
+        )
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+
+
 
     rows = cur.fetchall()
     conn.close()
@@ -628,34 +713,41 @@ def aggregate_money_range(start: Optional[datetime], end: Optional[datetime]) ->
 
 
 
-def create_money_plot(label: str, rows: List[Tuple[str, str, int]]) -> Optional[str]:
+def create_roulette_plot(label: str, rows: List[Tuple[str, str, int, int]]) -> Optional[str]:
     """
-    獲得金額集計結果から棒グラフPNGを生成し、ファイルパスを返す。
-    rows: [(player, slot, total_yen), ...]
+    ルーレット集計結果から棒グラフPNGを生成し、ファイルパスを返す。
+    rows: [(player, game, count, total_yen), ...]
     """
     if not rows:
         return None
 
     labels = []
     values = []
-    for player, slot, total_yen in rows:
-        labels.append(f"{player}\n{slot}")
+    for player, game, count, total_yen in rows:
+        labels.append(f"{player}\n{game}")
         values.append(total_yen)
 
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(10, 6))
     plt.bar(range(len(values)), values)
-    plt.xticks(range(len(values)), labels, rotation=90)
-    plt.title(f"Man10Casino 獲得金額合計 ({label})")
+    plt.xticks(range(len(values)), labels, rotation=45, ha="right")
+    plt.title(f"Man10Casino ルーレット獲得金額 ({label})")
     plt.ylabel("獲得金額(円)")
+
+    # Y軸は整数
+    from matplotlib.ticker import MaxNLocator
+    ax = plt.gca()
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+
     plt.tight_layout()
 
     safe_label = label.replace(" ", "_").replace("〜", "_").replace(":", "")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(BASE_DIR, f"casino_money_{safe_label}_{ts}.png")
+    out_path = os.path.join(BASE_DIR, f"roulette_{safe_label}_{ts}.png")
 
     plt.savefig(out_path)
     plt.close()
     return out_path
+
 
 def create_roulette_plot(label: str, rows: List[Tuple[str, int]]) -> Optional[str]:
     """
@@ -933,6 +1025,7 @@ async def tail_casino_log():
             await channel.send(f"🎰 {msg}")
 
             # 解析してDB保存（raw_message もきれいな方でOKなら msg を保存）
+            # 解析してDB保存
             parsed = parse_casino_message(msg)
             if parsed is not None:
                 player, slot, result = parsed
@@ -941,11 +1034,11 @@ async def tail_casino_log():
             # スロット当たり
             detect_and_save_slot_hits(msg, parsed)
 
-            # ルーレット獲得
+            # ★ ルーレット当たり（ルーレットだけ扱う）
             roulette = parse_roulette_message(msg)
             if roulette is not None:
-                r_player, r_amount = roulette
-                save_roulette_win(r_player, r_amount, msg)
+                r_player, r_game, r_amount = roulette
+                save_roulette_win(r_player, r_game, r_amount, msg)
 
     finally:
         f.close()
@@ -1052,15 +1145,15 @@ async def on_ready():
     
 @bot.tree.command(
     name="picture",
-    description="カジノ/ルーレットの集計グラフを送ります。all/today/week/month"
+    description="カジノデータのグラフ(PNG)を送ります。期間 + 対象(slot/roulette/all)"
 )
 async def picture_command(
     interaction: discord.Interaction,
     period: str = "today",
-    game: str = "casino"
+    target: str = "slot",   # ★ slot / roulette / all
 ):
     """
-    /picture [period] [game]
+    /picture [period] [target]
 
     period:
       - all   : 全期間
@@ -1068,17 +1161,18 @@ async def picture_command(
       - week  : 直近7日 (4:00区切り)
       - month : 直近30日 (4:00区切り)
 
-    game:
-      - casino   : スロット系 (デフォルト)
-      - roulette : ルーレット獲得
+    target:
+      - slot     : スロットだけ
+      - roulette : ルーレットだけ
+      - all      : 両方
     """
     await interaction.response.defer(thinking=True)
 
     period = period.lower()
-    game = game.lower()
+    target = target.lower()
     now = datetime.now()
 
-    # 4:00 区切りの「今日」の開始時刻を求める
+    # 4:00 区切りの「今日」の開始時刻
     stat_base_date = now.date()
     if now.hour < 4:
         stat_base_date = stat_base_date - timedelta(days=1)
@@ -1089,11 +1183,11 @@ async def picture_command(
         end = now
         label = f"today {start.strftime('%Y-%m-%d')}"
     elif period in ("week", "w"):
-        start = start_today - timedelta(days=6)  # 今日含め直近7日
+        start = start_today - timedelta(days=6)
         end = now
         label = f"week {start.strftime('%Y-%m-%d')}〜{stat_base_date.strftime('%Y-%m-%d')}"
     elif period in ("month", "m"):
-        start = start_today - timedelta(days=29)  # 今日含め直近30日
+        start = start_today - timedelta(days=29)
         end = now
         label = f"month {start.strftime('%Y-%m-%d')}〜{stat_base_date.strftime('%Y-%m-%d')}"
     else:
@@ -1101,89 +1195,73 @@ async def picture_command(
         end = None
         label = "all"
 
+    lines: List[str] = []
+    files: List[discord.File] = []
+
     # =============================
-    #  ルーレットモード
+    #  スロット系
     # =============================
-    if game in ("roulette", "r"):
+    if target in ("slot", "all", "s"):
+        rows_count = aggregate_range(start, end)
+        rows_money = aggregate_money_range(start, end)
+        rows_slot_totals = aggregate_slot_totals_range(start, end)
+
+        if rows_slot_totals:
+            lines.append("**▼ [スロット] スロット別 当たり回数合計 (上位10件)**")
+            for slot, total in rows_slot_totals[:10]:
+                lines.append(f"- {slot} → {total} 回")
+            lines.append("")
+
+        if rows_count:
+            lines.append("**▼ [スロット] 当たり回数ランキング (上位10件)**")
+            for player, slot, result, count in rows_count[:10]:
+                lines.append(f"- {player} / {slot} / {result} → {count}回")
+            lines.append("")
+
+        if rows_money:
+            lines.append("**▼ [スロット] 獲得金額ランキング (上位10件)**")
+            for player, slot, total_yen in rows_money[:10]:
+                lines.append(f"- {player} / {slot} → {total_yen} 円")
+            lines.append("")
+
+        img_slot_totals = create_slot_total_plot(label, rows_slot_totals) if rows_slot_totals else None
+        img_count = create_range_plot(label, rows_count) if rows_count else None
+        img_money = create_money_plot(label, rows_money) if rows_money else None
+
+        if img_slot_totals and os.path.exists(img_slot_totals):
+            files.append(discord.File(img_slot_totals, filename=os.path.basename(img_slot_totals)))
+        if img_count and os.path.exists(img_count):
+            files.append(discord.File(img_count, filename=os.path.basename(img_count)))
+        if img_money and os.path.exists(img_money):
+            files.append(discord.File(img_money, filename=os.path.basename(img_money)))
+
+    # =============================
+    #  ルーレット系
+    # =============================
+    if target in ("roulette", "all", "r"):
         rows_roulette = aggregate_roulette_range(start, end)
 
-        if not rows_roulette:
-            await interaction.followup.send(f"🎯 Roulette | {label} のデータはありませんでした。")
-            return
+        if rows_roulette:
+            lines.append("**▼ [ルーレット] 獲得金額ランキング (上位10件)**")
+            for player, game, count, total_yen in rows_roulette[:10]:
+                lines.append(f"- {player} / {game} → {total_yen} 円 ({count} 回)")
+            lines.append("")
 
-        # テキストまとめ（上位10人）
-        lines: List[str] = []
-        lines.append("**▼ ルーレット獲得金額ランキング (上位10件)**")
-        for player, total_amount in rows_roulette[:10]:
-            lines.append(f"- {player} → {total_amount} 円")
+        img_roulette = create_roulette_plot(label, rows_roulette) if rows_roulette else None
+        if img_roulette and os.path.exists(img_roulette):
+            files.append(discord.File(img_roulette, filename=os.path.basename(img_roulette)))
 
-        text = f"🎯 **Roulette | {label} の集計**\n" + "\n".join(lines)
-
-        # グラフ画像生成
-        img_path = create_roulette_plot(label, rows_roulette)
-        files = []
-        if img_path and os.path.exists(img_path):
-            files.append(discord.File(img_path, filename=os.path.basename(img_path)))
-
-        if files:
-            await interaction.followup.send(content=text, files=files)
-        else:
-            await interaction.followup.send(text)
-
+    if not lines:
+        await interaction.followup.send(f"📊 {label} ({target}) のデータはありませんでした。")
         return
 
-    # =============================
-    #  通常（スロット系）モード
-    # =============================
-    rows_count = aggregate_range(start, end)
-    rows_money = aggregate_money_range(start, end)
-    rows_slot_totals = aggregate_slot_totals_range(start, end)
-
-    if not rows_count and not rows_money and not rows_slot_totals:
-        await interaction.followup.send(f"📊 {label} のデータはありませんでした。")
-        return
-
-    lines: List[str] = []
-
-    # スロット別合計（テキスト）
-    if rows_slot_totals:
-        lines.append("**▼ スロット別 当たり回数合計**")
-        for slot, total in rows_slot_totals[:10]:
-            lines.append(f"- {slot} → {total} 回")
-        lines.append("")
-
-    # プレイヤー別×スロット×結果のランキング
-    if rows_count:
-        lines.append("**▼ 当たり回数ランキング (上位10件)**")
-        for player, slot, result, count in rows_count[:10]:
-            lines.append(f"- {player} / {slot} / {result} → {count}回")
-        lines.append("")
-
-    # 金額ランキング
-    if rows_money:
-        lines.append("**▼ 獲得金額ランキング (上位10件)**")
-        for player, slot, total_yen in rows_money[:10]:
-            lines.append(f"- {player} / {slot} → {total_yen} 円")
-
-    text = f"📊 **{label} の Man10Casino 集計**\n" + "\n".join(lines)
-
-    # グラフ生成
-    img_slot_totals = create_slot_total_plot(label, rows_slot_totals) if rows_slot_totals else None
-    img_count = create_range_plot(label, rows_count) if rows_count else None
-    img_money = create_money_plot(label, rows_money) if rows_money else None
-
-    files = []
-    if img_slot_totals and os.path.exists(img_slot_totals):
-        files.append(discord.File(img_slot_totals, filename=os.path.basename(img_slot_totals)))
-    if img_count and os.path.exists(img_count):
-        files.append(discord.File(img_count, filename=os.path.basename(img_count)))
-    if img_money and os.path.exists(img_money):
-        files.append(discord.File(img_money, filename=os.path.basename(img_money)))
+    text = f"📊 **{label} の Man10Casino 集計 ({target})**\n" + "\n".join(lines)
 
     if files:
         await interaction.followup.send(content=text, files=files)
     else:
         await interaction.followup.send(text)
+
 
 
 
