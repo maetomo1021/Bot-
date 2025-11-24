@@ -79,6 +79,13 @@ CASINO_KEYWORDS = [
     "段目",
     "雷"
 ]
+# Minecraft のカラーコード (例: §a, §l など) を消す用
+MC_COLOR_PATTERN = re.compile(r"§.")
+
+
+def strip_mc_color_codes(msg: str) -> str:
+    """Minecraft のカラー・装飾コード (§a, §l, …) を全部削除する"""
+    return MC_COLOR_PATTERN.sub("", msg)
 
 # SQLite DB のパス
 DB_PATH = os.path.join(BASE_DIR, "casino.db")
@@ -838,33 +845,40 @@ async def tail_casino_log():
                 continue
 
             try:
-                msg = line.split("[CHAT]", 1)[1].strip()
+                raw_msg = line.split("[CHAT]", 1)[1].strip()
             except Exception:
                 continue
 
+            # カラーコードを除去したメッセージ
+            msg = strip_mc_color_codes(raw_msg)
+
             if not any(k in msg for k in CASINO_KEYWORDS):
                 continue
-            # 重複メッセージチェック
+
+            # 重複メッセージチェック（クリーン後の文字列で比較）
             global last_casino_message
             if msg == last_casino_message:
-                continue  # 前回と同じ内容なら送らない＆保存しない
+                continue
             last_casino_message = msg
 
-            # Discordにそのまま流す
+            # Discordにきれいな文字列を流す
             await channel.send(f"🎰 {msg}")
 
-            # 解析してDB保存
+            # 解析してDB保存（raw_message もきれいな方でOKなら msg を保存）
             parsed = parse_casino_message(msg)
             if parsed is not None:
                 player, slot, result = parsed
                 save_spin(player, slot, result, msg)
-            # ★ スロットごとの「当たり」を判定して slot_hits に保存
+
+            # スロット当たり
             detect_and_save_slot_hits(msg, parsed)
-            
+
+            # ルーレット獲得
             roulette = parse_roulette_message(msg)
             if roulette is not None:
                 r_player, r_amount = roulette
                 save_roulette_win(r_player, r_amount, msg)
+
     finally:
         f.close()
         await channel.send("🛑 Man10Casino ログ監視を停止しました。")
