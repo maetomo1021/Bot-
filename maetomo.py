@@ -493,6 +493,44 @@ def aggregate_range(start: Optional[datetime], end: Optional[datetime]) -> List[
 
     conn.close()
     return rows
+def aggregate_slot_totals_range(start: Optional[datetime], end: Optional[datetime]) -> List[Tuple[str, int]]:
+    """
+    指定した時間範囲 [start, end) について
+    スロットごとの合計回数を集計して返す。
+    ルーレット(スロット名に「ルーレット / Roulette」を含むもの)は除外。
+    戻り値: [(slot, total_count), ...]
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    if start is None or end is None:
+        cur.execute(
+            """
+            SELECT slot, COUNT(*)
+            FROM spins
+            WHERE slot NOT LIKE '%ルーレット%'
+              AND slot NOT LIKE '%Roulette%'
+            GROUP BY slot
+            ORDER BY COUNT(*) DESC
+            """
+        )
+    else:
+        cur.execute(
+            """
+            SELECT slot, COUNT(*)
+            FROM spins
+            WHERE ts >= ? AND ts < ?
+              AND slot NOT LIKE '%ルーレット%'
+              AND slot NOT LIKE '%Roulette%'
+            GROUP BY slot
+            ORDER BY COUNT(*) DESC
+            """,
+            (start.isoformat(timespec="seconds"), end.isoformat(timespec="seconds")),
+        )
+
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 
 def aggregate_roulette_range(start: Optional[datetime], end: Optional[datetime]) -> List[Tuple[str, int]]:
@@ -676,6 +714,36 @@ def create_range_plot(label: str, rows: List[Tuple[str, str, str, int]]) -> Opti
     safe_label = label.replace(" ", "_").replace("〜", "_").replace(":", "")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(BASE_DIR, f"casino_{safe_label}_{ts}.png")
+
+    plt.savefig(out_path)
+    plt.close()
+    return out_path
+def create_slot_total_plot(label: str, rows: List[Tuple[str, int]]) -> Optional[str]:
+    """
+    スロットごとの合計回数から棒グラフPNGを生成し、ファイルパスを返す。
+    rows: [(slot, total_count), ...]
+    """
+    if not rows:
+        return None
+
+    slots = [r[0] for r in rows]
+    values = [r[1] for r in rows]
+
+    plt.figure(figsize=(10, 6))
+    plt.bar(range(len(values)), values)
+    plt.xticks(range(len(values)), slots, rotation=45, ha="right")
+    plt.title(f"Man10Casino スロット別当たり回数 ({label})")
+    plt.ylabel("回数")
+
+    # Y軸は整数だけにする
+    ax = plt.gca()
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+
+    plt.tight_layout()
+
+    safe_label = label.replace(" ", "_").replace("〜", "_").replace(":", "")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(BASE_DIR, f"casino_slots_{safe_label}_{ts}.png")
 
     plt.savefig(out_path)
     plt.close()
@@ -1069,18 +1137,29 @@ async def picture_command(
     # =============================
     rows_count = aggregate_range(start, end)
     rows_money = aggregate_money_range(start, end)
+    rows_slot_totals = aggregate_slot_totals_range(start, end)
 
-    if not rows_count and not rows_money:
+    if not rows_count and not rows_money and not rows_slot_totals:
         await interaction.followup.send(f"📊 {label} のデータはありませんでした。")
         return
 
     lines: List[str] = []
+
+    # スロット別合計（テキスト）
+    if rows_slot_totals:
+        lines.append("**▼ スロット別 当たり回数合計**")
+        for slot, total in rows_slot_totals[:10]:
+            lines.append(f"- {slot} → {total} 回")
+        lines.append("")
+
+    # プレイヤー別×スロット×結果のランキング
     if rows_count:
         lines.append("**▼ 当たり回数ランキング (上位10件)**")
         for player, slot, result, count in rows_count[:10]:
             lines.append(f"- {player} / {slot} / {result} → {count}回")
         lines.append("")
 
+    # 金額ランキング
     if rows_money:
         lines.append("**▼ 獲得金額ランキング (上位10件)**")
         for player, slot, total_yen in rows_money[:10]:
@@ -1088,10 +1167,14 @@ async def picture_command(
 
     text = f"📊 **{label} の Man10Casino 集計**\n" + "\n".join(lines)
 
+    # グラフ生成
+    img_slot_totals = create_slot_total_plot(label, rows_slot_totals) if rows_slot_totals else None
     img_count = create_range_plot(label, rows_count) if rows_count else None
     img_money = create_money_plot(label, rows_money) if rows_money else None
 
     files = []
+    if img_slot_totals and os.path.exists(img_slot_totals):
+        files.append(discord.File(img_slot_totals, filename=os.path.basename(img_slot_totals)))
     if img_count and os.path.exists(img_count):
         files.append(discord.File(img_count, filename=os.path.basename(img_count)))
     if img_money and os.path.exists(img_money):
@@ -1101,6 +1184,7 @@ async def picture_command(
         await interaction.followup.send(content=text, files=files)
     else:
         await interaction.followup.send(text)
+
 
 
 
